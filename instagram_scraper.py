@@ -9,6 +9,8 @@ import os
 import sys
 import re
 import time
+import json
+import hashlib
 import threading
 import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox
@@ -41,6 +43,7 @@ class InstagramScraperGUI:
         self.driver = None
         self.running = False
         self.stop_requested = False
+        self.posts_data = []  # Lista para guardar links y metadata
         
         self.setup_ui()
         self.create_directories()
@@ -262,62 +265,81 @@ class InstagramScraperGUI:
             self.driver.execute_script("window.scrollTo(0, 0);")
             time.sleep(1)
             
+            # Esperar a que el grid de posts aparezca
+            self.log("   ⏳ Esperando a que el contenido cargue...", 'info')
+            time.sleep(5)
+            
+            # Verificar si es cuenta privada
+            is_private = self.driver.find_elements(By.XPATH, "//*[contains(text(), 'Esta cuenta es privada') or contains(text(), 'This Account is Private')]")
+            if is_private:
+                self.log("❌ La cuenta es PRIVADA. No se pueden ver los posts.", 'error')
+                return
+
             # Buscar el primer post
             self.log("\n🔍 Buscando posts...", 'info')
             
             # Intentar múltiples selectores para encontrar posts
             posts = []
             
-            # Estrategia 1: Links con href /p/ o /reel/
+            # Estrategia 1: Links con href /p/ o /reel/ (Instagram usa estos formatos)
             selectors_to_try = [
                 "a[href*='/p/']",
                 "a[href*='/reel/']",
+                "div._aabd a",  # Selector común para thumbnails
                 "div._ac7v a",  # Grid container links
-                "div._aabd a",  # Alternative grid
-                "main a[href*='/p/']",
-                "section main a[href*='/p/']"
+                "main article a",
+                "a img" # Buscar links que tengan una imagen dentro
             ]
             
             for selector in selectors_to_try:
                 try:
-                    posts = self.driver.find_elements(By.CSS_SELECTOR, selector)
-                    if posts:
-                        self.log(f"   ℹ️ Usando selector: {selector}", 'info')
+                    all_elements = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                    # Filtrar solo los que parecen ser de posts
+                    valid_posts = [e for e in all_elements if e.get_attribute('href') and ('/p/' in e.get_attribute('href') or '/reel/' in e.get_attribute('href'))]
+                    if valid_posts:
+                        posts = valid_posts
+                        self.log(f"   ✅ Encontrados {len(posts)} posts con selector: {selector}", 'success')
                         break
                 except:
                     continue
             
-            # Estrategia 2: JavaScript para buscar todos los links de posts
+            # Estrategia 2: JavaScript para buscar todos los links de posts (como último recurso)
             if not posts:
-                self.log("   🔍 Usando JavaScript para buscar posts...", 'info')
+                self.log("   🔍 Usando JavaScript profundo para buscar posts...", 'info')
                 posts = self.driver.execute_script("""
                     return Array.from(document.querySelectorAll('a')).filter(a => 
                         a.href && (a.href.includes('/p/') || a.href.includes('/reel/'))
-                    );
+                    ).map(a => a); // El mapa es para asegurar que Selenium reciba los elementos
                 """)
             
-            # Debug: mostrar cuántos links hay en total
+            # Debug intensivo si falla
             if not posts:
+                self.log("⚠️ No se detectaron posts. Iniciando diagnóstico...", 'warning')
+                
+                # 1. ¿Cuántos links hay?
                 total_links = self.driver.execute_script("return document.querySelectorAll('a').length;")
-                self.log(f"   🔍 Debug: {total_links} links totales en la página", 'warning')
+                self.log(f"   📊 Resumen: {total_links} links totales en la página", 'info')
                 
-                # Mostrar algunos hrefs para debug
-                sample_hrefs = self.driver.execute_script("""
-                    return Array.from(document.querySelectorAll('a')).slice(0, 10).map(a => a.href);
-                """)
-                for href in sample_hrefs[:5]:
-                    self.log(f"      - {href[:60]}...", 'info')
+                # 2. ¿Hay algún article?
+                articles = self.driver.find_elements(By.TAG_NAME, "article")
+                self.log(f"   📊 Resumen: {len(articles)} elementos <article> encontrados", 'info')
                 
-                # Guardar screenshot para debug
-                debug_path = os.path.join(OUTPUT_DIR, "debug_screenshot.png")
+                # 3. Guardar HTML para análisis (opcional, pesado)
+                # 4. Screenshot de la zona central
+                debug_path = os.path.join(OUTPUT_DIR, "error_grid.png")
                 self.driver.save_screenshot(debug_path)
-                self.log(f"   📸 Screenshot guardado: {debug_path}", 'warning')
+                self.log(f"   📸 Pantallazo de error guardado: {debug_path}", 'warning')
+                self.log("   👉 Revisa si en el navegador ves el grid de fotos o una página en blanco/login", 'info')
             
             if not posts:
-                self.log("❌ No se encontraron posts", 'error')
-                self.log("   Verifica que la cuenta tenga posts públicos", 'warning')
-                self.log("   Revisa el screenshot en Desktop/instagram_posts/", 'warning')
+                self.log("\n❌ NO SE ENCONTRARON POSTS", 'error')
+                self.log("   Posibles razones:", 'info')
+                self.log("   1. Instagram te está pidiendo un CAPTCHA", 'info')
+                self.log("   2. La sesión se cerró y ves la pantalla de login", 'info')
+                self.log("   3. Instagram bloqueó las peticiones automáticas temporalmente", 'info')
                 return
+            
+            self.log(f"   🚀 Iniciando desde el primer post encontrado...", 'success')
             
             self.log(f"   ✅ Encontrados {len(posts)} posts", 'success')
             
@@ -345,19 +367,35 @@ class InstagramScraperGUI:
                 # Detectar tipo de post
                 post_type = self._detect_post_type()
                 
+                # Crear datos del post
+                post_data = {
+                    "id": post_id,
+                    "url": current_url,
+                    "type": post_type,
+                    "scraped_at": datetime.now().isoformat(),
+                    "images": []
+                }
+                
                 if post_type == "reel":
                     self.log("   📹 Tipo: REEL (saltando)", 'warning')
                     self.count_reels += 1
+                    post_data["skipped"] = True
                     
                 elif post_type == "carousel":
                     self.log("   📚 Tipo: CARRUSEL", 'success')
                     self.count_carruseles += 1
-                    self._save_carousel(post_id)
+                    images = self._save_carousel(post_id)
+                    post_data["images"] = images
                     
                 else:  # single image
                     self.log("   🖼️ Tipo: IMAGEN ÚNICA", 'success')
                     self.count_imagenes += 1
-                    self._save_single_image(post_id)
+                    images = self._save_single_image(post_id)
+                    post_data["images"] = images
+                
+                # Guardar datos del post
+                self.posts_data.append(post_data)
+                self._save_posts_json()
                 
                 self.update_counters()
                 
@@ -421,41 +459,185 @@ class InstagramScraperGUI:
             return "single"
     
     def _save_carousel(self, post_id):
-        """Guarda todas las imágenes del carrusel."""
+        """Guarda todas las imágenes del carrusel evitando duplicados."""
         folder = os.path.join(CARRUSELES_DIR, post_id)
         os.makedirs(folder, exist_ok=True)
         
+        saved_images = []  # Lista de URLs guardadas
+        seen_hashes = set()  # Hashes de imágenes ya vistas para evitar duplicados
         img_count = 0
-        max_images = 10  # Límite de seguridad
+        max_images = 15  # Límite de seguridad
+        consecutive_duplicates = 0
         
         while img_count < max_images:
-            img_count += 1
+            # Obtener la URL de la imagen actual
+            img_url = self._get_current_image_url()
             
-            # Tomar screenshot del contenedor de imagen
-            self._take_post_screenshot(folder, img_count)
-            self.log(f"      💾 Imagen {img_count} guardada", 'success')
+            if img_url:
+                # Crear hash de la URL para detectar duplicados
+                url_hash = hashlib.md5(img_url.encode()).hexdigest()[:16]
+                
+                if url_hash not in seen_hashes:
+                    seen_hashes.add(url_hash)
+                    consecutive_duplicates = 0
+                    img_count += 1
+                    
+                    # Tomar screenshot del contenedor de imagen
+                    filepath = self._take_post_screenshot(folder, img_count)
+                    saved_images.append({
+                        "index": img_count,
+                        "url": img_url,
+                        "file": filepath
+                    })
+                    self.log(f"      💾 Imagen {img_count} guardada", 'success')
+                else:
+                    consecutive_duplicates += 1
+                    self.log(f"      ⏭️ Imagen duplicada detectada ({consecutive_duplicates})", 'warning')
+                    if consecutive_duplicates >= 2:
+                        # Si vimos 2 duplicados seguidos, probablemente ya terminamos
+                        break
+            else:
+                # Si no encontramos imagen, intentamos continuar
+                img_count += 1
+                filepath = self._take_post_screenshot(folder, img_count)
+                self.log(f"      💾 Imagen {img_count} guardada (sin URL)", 'warning')
             
             # Intentar ir a la siguiente imagen del carrusel
-            try:
-                next_btn = self.driver.find_element(By.CSS_SELECTOR, 
-                    "button[aria-label*='Siguiente'], button[aria-label*='Next']")
-                self.driver.execute_script("arguments[0].click();", next_btn)
-                time.sleep(0.8)
-            except NoSuchElementException:
+            # IMPORTANTE: Buscar el botón DENTRO del article (carrusel), no el de navegación entre posts
+            if not self._click_carousel_next():
                 break  # No hay más imágenes
+            
+            time.sleep(1.2)  # Esperar a que cargue la siguiente imagen
         
         self.log(f"   📁 Guardado en: {folder}", 'info')
+        return saved_images
+    
+    def _click_carousel_next(self):
+        """Hace clic en el botón 'Siguiente' del carrusel (no el de posts)."""
+        try:
+            # Buscar específicamente dentro del article (contenedor del post modal)
+            # El botón del carrusel está DENTRO del contenedor de la imagen
+            carousel_selectors = [
+                # Selector específico para el botón de siguiente en carrusel (dentro de la lista de imágenes)
+                "article div._aahi button[aria-label*='Siguiente']",
+                "article div._aahi button[aria-label*='Next']",
+                # Botón dentro del contenedor de imágenes del carrusel
+                "article ul button[aria-label*='Siguiente']",
+                "article ul button[aria-label*='Next']",
+                # Selector más genérico pero dentro del article
+                "article div[role='presentation'] button[aria-label*='Siguiente']",
+                "article div[role='presentation'] button[aria-label*='Next']",
+                # Botón que está al lado derecho de la imagen (posición relativa)
+                "article div._aagw button[aria-label*='Siguiente']",
+                "article div._aagw button[aria-label*='Next']",
+            ]
+            
+            for selector in carousel_selectors:
+                try:
+                    btns = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                    for btn in btns:
+                        if btn.is_displayed() and btn.is_enabled():
+                            # Verificar que no sea el botón de navegación entre posts
+                            # El botón del carrusel suele estar más cerca de la imagen
+                            self.driver.execute_script("arguments[0].click();", btn)
+                            return True
+                except:
+                    continue
+            
+            # Método alternativo: buscar por la estructura del DOM
+            # El botón del carrusel tiene un SVG con el chevron hacia la derecha
+            try:
+                next_btn = self.driver.execute_script("""
+                    // Buscar dentro del article el botón de siguiente del carrusel
+                    var article = document.querySelector('article');
+                    if (!article) return null;
+                    
+                    // Buscar todos los botones con Siguiente/Next
+                    var buttons = article.querySelectorAll('button[aria-label*="Siguiente"], button[aria-label*="Next"]');
+                    
+                    for (var btn of buttons) {
+                        // El botón del carrusel está dentro del contenedor de la imagen
+                        // y tiene un ancestro con la clase _aahi o similar
+                        var parent = btn.closest('div._aahi, div._aagw, ul');
+                        if (parent && btn.offsetParent !== null) {
+                            return btn;
+                        }
+                    }
+                    
+                    // Si no encontramos con la estructura específica, buscar el que esté visible
+                    for (var btn of buttons) {
+                        if (btn.offsetParent !== null) {
+                            return btn;
+                        }
+                    }
+                    
+                    return null;
+                """)
+                
+                if next_btn:
+                    self.driver.execute_script("arguments[0].click();", next_btn)
+                    return True
+            except:
+                pass
+            
+            return False
+            
+        except Exception as e:
+            self.log(f"      ⚠️ Error al navegar: {e}", 'warning')
+            return False
     
     def _save_single_image(self, post_id):
         """Guarda la imagen única."""
         folder = os.path.join(IMAGENES_DIR, post_id)
         os.makedirs(folder, exist_ok=True)
         
-        self._take_post_screenshot(folder, 1)
+        img_url = self._get_current_image_url()
+        filepath = self._take_post_screenshot(folder, 1)
         self.log(f"   💾 Imagen guardada en: {folder}", 'success')
+        
+        return [{
+            "index": 1,
+            "url": img_url,
+            "file": filepath
+        }]
+    
+    def _get_current_image_url(self):
+        """Obtiene la URL de la imagen actualmente visible en el post."""
+        try:
+            # Intentar múltiples selectores para encontrar la imagen
+            selectors = [
+                "article div._aagv img",
+                "article div._aatk img", 
+                "article img[style*='object-fit']",
+                "article div[role='button'] img",
+                "article ul li[style*='translateX'] img",  # Imagen activa en carrusel
+            ]
+            
+            for selector in selectors:
+                try:
+                    imgs = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                    for img in imgs:
+                        src = img.get_attribute('src')
+                        if src and 'instagram' in src and not 'data:' in src:
+                            return src
+                except:
+                    continue
+            
+            # Fallback: buscar cualquier imagen grande en el artículo
+            imgs = self.driver.find_elements(By.CSS_SELECTOR, "article img")
+            for img in imgs:
+                src = img.get_attribute('src')
+                if src and 'instagram' in src and 'scontent' in src:
+                    return src
+                    
+        except Exception as e:
+            pass
+        
+        return None
     
     def _take_post_screenshot(self, folder, index):
         """Toma screenshot del área del post."""
+        filepath = os.path.join(folder, f"{index}.png")
         try:
             # Buscar el contenedor de la imagen/contenido
             media = self.driver.find_element(By.CSS_SELECTOR, 
@@ -466,13 +648,26 @@ class InstagramScraperGUI:
             time.sleep(0.3)
             
             # Screenshot del elemento
-            filepath = os.path.join(folder, f"{index}.png")
             media.screenshot(filepath)
             
         except:
             # Fallback: screenshot de toda la ventana
-            filepath = os.path.join(folder, f"{index}.png")
             self.driver.save_screenshot(filepath)
+        
+        return filepath
+    
+    def _save_posts_json(self):
+        """Guarda todos los links y datos de los posts en un archivo JSON."""
+        json_path = os.path.join(OUTPUT_DIR, "posts_data.json")
+        try:
+            with open(json_path, 'w', encoding='utf-8') as f:
+                json.dump({
+                    "scraped_at": datetime.now().isoformat(),
+                    "total_posts": len(self.posts_data),
+                    "posts": self.posts_data
+                }, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            self.log(f"   ⚠️ Error guardando JSON: {e}", 'warning')
     
     def _go_to_next_post(self):
         """Navega al siguiente post."""
